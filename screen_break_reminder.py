@@ -1,5 +1,6 @@
 import tkinter as tk
 import ctypes
+from ctypes import wintypes
 import math
 import os
 import socket
@@ -57,6 +58,12 @@ TIMER_BG = "#111111"
 TIMER_FG = "#ffffff"
 TIMER_ALPHA = 0.88          # 1.0 = solid, lower = more see-through
 
+# Screen lock during breaks
+LOCK_SCREEN = True          # True = mouse and keyboard are blocked while on break
+DIM_ALPHA = 0.45            # How dark the screen gets during a break (0 = clear, 1 = black)
+# Emergency skip: Ctrl + Shift + Q ends the break early.
+# Ctrl + Alt + Del always works too (Windows never lets apps block it).
+
 # ---------------------------------------------------------
 # Tracking Variables
 # ---------------------------------------------------------
@@ -83,6 +90,129 @@ timer_text = None
 cat_overlay = None               # The cat currently on screen (if any)
 cat_frames = None                # Prepared GIF frames (loaded once)
 cat_durations = None
+dim_window = None                # Full-screen dark layer that swallows mouse clicks
+skip_requested = False           # Set by the emergency key combo
+
+
+# ---------------------------------------------------------
+# Keyboard Lock (Windows low-level keyboard hook)
+# ---------------------------------------------------------
+# While the hook is installed, every key press on the computer is swallowed
+# (Win key, Alt+Tab, Alt+F4, typing...). Ctrl+Alt+Del still works because
+# Windows handles it before any app can see it - that is the safety exit.
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0100, 0x0101, 0x0104, 0x0105
+VK_Q = 0x51
+CTRL_KEYS = {0x11, 0xA2, 0xA3}
+SHIFT_KEYS = {0x10, 0xA0, 0xA1}
+
+LRESULT = ctypes.c_ssize_t
+HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
+                ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
+try:
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _user32.SetWindowsHookExW.argtypes = (ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD)
+    _user32.SetWindowsHookExW.restype = wintypes.HHOOK
+    _user32.CallNextHookEx.argtypes = (wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+    _user32.CallNextHookEx.restype = LRESULT
+    _user32.UnhookWindowsHookEx.argtypes = (wintypes.HHOOK,)
+    _user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+    _kernel32.GetModuleHandleW.argtypes = (wintypes.LPCWSTR,)
+    _kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+except (AttributeError, OSError):
+    _user32 = None              # Not on Windows - the lock is simply skipped
+
+_kb_hook = None
+_held_keys = set()
+
+
+def _keyboard_proc(n_code, w_param, l_param):
+    global skip_requested
+    try:
+        if n_code == 0:
+            vk = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents.vkCode
+            if w_param in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                _held_keys.add(vk)
+                # Emergency skip: Ctrl + Shift + Q. Only a flag is set here;
+                # the break timer picks it up (no Tk calls inside the hook).
+                if vk == VK_Q and _held_keys & CTRL_KEYS and _held_keys & SHIFT_KEYS:
+                    skip_requested = True
+            elif w_param in (WM_KEYUP, WM_SYSKEYUP):
+                _held_keys.discard(vk)
+            return 1            # Swallow the key: no other app receives it
+    except Exception:
+        pass
+    return _user32.CallNextHookEx(None, n_code, w_param, l_param)
+
+
+_keyboard_proc_ref = HOOKPROC(_keyboard_proc)   # keep a reference so it isn't garbage-collected
+
+
+def lock_keyboard():
+    global _kb_hook
+    if _user32 is None or _kb_hook:
+        return
+    _held_keys.clear()
+    _kb_hook = _user32.SetWindowsHookExW(
+        WH_KEYBOARD_LL, _keyboard_proc_ref, _kernel32.GetModuleHandleW(None), 0
+    )
+    if not _kb_hook:
+        print("Note: could not lock the keyboard, error", ctypes.get_last_error())
+
+
+def unlock_keyboard():
+    global _kb_hook
+    if _kb_hook:
+        _user32.UnhookWindowsHookEx(_kb_hook)
+        _kb_hook = None
+    _held_keys.clear()
+
+
+# ---------------------------------------------------------
+# Dark layer over every monitor (blocks mouse clicks)
+# ---------------------------------------------------------
+def virtual_screen_rect():
+    """Position and size of the area covering ALL monitors."""
+    try:
+        gsm = ctypes.windll.user32.GetSystemMetrics
+        return gsm(76), gsm(77), gsm(78), gsm(79)   # x, y, width, height
+    except AttributeError:
+        return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+
+
+def open_dim_layer():
+    global dim_window
+    x, y, w, h = virtual_screen_rect()
+    dim_window = tk.Toplevel(root)
+    dim_window.overrideredirect(True)
+    dim_window.attributes("-topmost", True)
+    dim_window.attributes("-alpha", DIM_ALPHA)
+    dim_window.configure(bg="black")
+    try:
+        dim_window.configure(cursor="none")   # hide the mouse pointer
+    except tk.TclError:
+        pass
+    dim_window.geometry(f"{w}x{h}{x:+d}{y:+d}")
+    dim_window.protocol("WM_DELETE_WINDOW", lambda: None)
+    dim_window.focus_force()
+
+
+def close_dim_layer():
+    global dim_window
+    if dim_window is not None:
+        try:
+            dim_window.destroy()
+        except tk.TclError:
+            pass
+        dim_window = None
 
 
 # ---------------------------------------------------------
@@ -316,9 +446,16 @@ def open_break_window():
     global break_timer_running, break_started_at
     global timer_window, timer_canvas, timer_text, cat_overlay
 
+    global skip_requested
     break_timer_running = True
     break_started_at = time.monotonic()
+    skip_requested = False
     set_main_window_enabled(False)
+
+    # Lock the screen first, so the countdown and the cat appear ON TOP of it
+    if LOCK_SCREEN:
+        open_dim_layer()
+        lock_keyboard()
 
     # Borderless, always-on-top, slightly see-through box with rounded corners
     W, H = 230, 110
@@ -357,7 +494,13 @@ def update_break_timer():
     remaining = max(0.0, BREAK_SECONDS - (time.monotonic() - break_started_at))
     timer_canvas.itemconfig(timer_text, text=format_countdown(remaining))
 
-    if remaining > 0:
+    if skip_requested:
+        # Emergency skip (Ctrl + Shift + Q): end the break early, not counted
+        finish_break(completed=False)
+        active_work_seconds = 0.0
+        timer_label.config(text="00:00")
+        start_monitoring()
+    elif remaining > 0:
         root.after(BREAK_TICK_MS, update_break_timer)
     else:
         finish_break(completed=True)
@@ -378,6 +521,10 @@ def finish_break(completed):
     break_timer_running = False
     if completed:
         break_count += 1
+
+    # Unlock first, so the user gets control back even if anything below fails
+    unlock_keyboard()
+    close_dim_layer()
 
     if timer_window is not None:
         try:
@@ -635,4 +782,7 @@ tk.Button(
 # ---------------------------------------------------------
 root.after(300, preload_cat)
 start_monitoring()
-root.mainloop()
+try:
+    root.mainloop()
+finally:
+    unlock_keyboard()       # Never leave the keyboard locked, even after a crash
